@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>نموذج تنبيه النعاس — نسخة الويب</title>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #0b1220; color: #e8eefc; }
+    .wrap { display: grid; place-items: center; min-height: 100vh; padding: 16px; }
+    .card { width: min(700px, 100%); background: #131c31; border: 1px solid #223052; border-radius: 16px; padding: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    p { margin: 6px 0; line-height: 1.6; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+    button { appearance: none; border: 0; background: #2a3a67; color: #fff; padding: 10px 14px; border-radius: 12px; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    .panel { background: #0f1628; border: 1px solid #223052; border-radius: 12px; padding: 12px; }
+    video, canvas { width: 100%; max-height: 50vh; border-radius: 12px; background: #000; }
+    .stats { display: flex; gap: 12px; font-size: 14px; opacity: .9; flex-wrap: wrap; }
+    .tag { background: #1c2a4f; padding: 6px 10px; border-radius: 999px; }
+    .footer { opacity: .7; font-size: 12px; margin-top: 8px; }
+    label { font-size: 14px; opacity: .9; }
+    input[type=range] { width: 100%; }
+  </style>
+  <!-- Mediapipe Face Mesh + utils (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>نموذج تنبيه النعاس (نسخة ويب — iPhone)</h1>
+      <p>اضغط <b>بدء</b> ثم اسمح بالكاميرا. إذا انغلقت عيناك ≥ 1 ثانية سيبدأ تنبيه بصوت منخفض ويتزايد ما دمت مغمض العينين.</p>
+
+      <div class="controls">
+        <button id="startBtn">بدء</button>
+        <button id="stopBtn" disabled>إيقاف</button>
+      </div>
+
+      <div class="row">
+        <div class="panel">
+          <video id="video" playsinline muted></video>
+          <canvas id="overlay"></canvas>
+        </div>
+        <div class="panel">
+          <div class="stats">
+            <span class="tag">EAR: <span id="earVal">-</span></span>
+            <span class="tag">الحالة: <span id="state">جاهز</span></span>
+            <span class="tag">مغلق منذ: <span id="closedMs">0</span> ms</span>
+          </div>
+          <div style="margin-top:10px">
+            <label>عتبة إغلاق العين (EAR)
+              <input id="thresh" type="range" min="0.15" max="0.40" step="0.005" value="0.27">
+            </label>
+            <div class="footer">كلما كانت أصغر صارت الحساسية أعلى. القيمة الافتراضية 0.27 مناسبة كبداية.</div>
+          </div>
+        </div>
+      </div>
+
+      <p class="footer">تلميح iPhone: يجب الضغط على <b>بدء</b> لتفعيل الكاميرا والصوت (قيود iOS). تأكد أن زر كتم الصوت غير مُفعّل وأن مستوى الصوت مناسب.</p>
+    </div>
+  </div>
+
+  <script>
+    // عناصر الواجهة
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn  = document.getElementById('stopBtn');
+    const video    = document.getElementById('video');
+    const canvas   = document.getElementById('overlay');
+    const ctx      = canvas.getContext('2d');
+    const earSpan  = document.getElementById('earVal');
+    const stateEl  = document.getElementById('state');
+    const closedEl = document.getElementById('closedMs');
+    const threshEl = document.getElementById('thresh');
+
+    // Web Audio
+    let audioCtx, osc, gain;
+    function initAudio() {
+      if (audioCtx) return;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      gain = audioCtx.createGain();
+      gain.gain.value = 0.0; // ابدأ صامتًا
+      osc = audioCtx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = 1000; // 1 كيلوهرتز
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start();
+    }
+    function setVolume(v) {
+      if (!gain || !audioCtx) return;
+      const now = audioCtx.currentTime;
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setTargetAtTime(v, now, 0.05); // سموث
+    }
+    function stopAudio() { if (audioCtx) setVolume(0); }
+
+    // حالة الكشف
+    let closedStart = null;           // طابع زمني عند بداية الإغلاق
+    const HOLD_MS = 1000;             // 1s قبل بدء التنبيه
+    const RAMP_MS = 4000;             // للوصول لأقصى صوت
+    let rafId = null;                 // requestAnimationFrame loop
+    let processing = false;           // منع تداخل الإطارات أثناء الإرسال
+
+    // دوال EAR من 6 نقاط لكل عين
+    function euclid(a, b) { const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx, dy); }
+    function ear(eye) {
+      const A = euclid(eye[1], eye[5]);
+      const B = euclid(eye[2], eye[4]);
+      const C = euclid(eye[0], eye[3]);
+      return (A + B) / (2.0 * C);
+    }
+    // فهارس نقاط العينين في Mediapipe (refineLandmarks=true)
+    // عين يسار: 33,160,158,133,153,144
+    // عين يمين: 362,385,387,263,373,380
+    function pickEyeLandmarks(lms, idx) { return idx.map(i => ({x:lms[i].x, y:lms[i].y})); }
+
+    // FaceMesh
+    let faceMesh;
+    async function setupFaceMesh() {
+      faceMesh = new FaceMesh({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
+      faceMesh.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: true,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+      faceMesh.onResults(onResults);
+    }
+
+    // كاميرا أمامية عبر getUserMedia (لضمان front camera على iPhone)
+    async function startCamera() {
+      // طلب الكاميرا الأمامية
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      resizeCanvas();
+
+      // حلقة المعالجة
+      const loop = async () => {
+        if (!processing && faceMesh) {
+          processing = true;
+          await faceMesh.send({ image: video });
+          processing = false;
+        }
+        rafId = requestAnimationFrame(loop);
+      };
+      loop();
+    }
+
+    function resizeCanvas() {
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    function onResults(res) {
+      if (!res.multiFaceLandmarks || res.multiFaceLandmarks.length === 0) {
+        drawFrame(null);
+        handleEyesOpen();
+        return;
+      }
+      const lms = res.multiFaceLandmarks[0];
+      const left = pickEyeLandmarks(lms, [33,160,158,133,153,144]);
+      const right= pickEyeLandmarks(lms, [362,385,387,263,373,380]);
+
+      const leftEAR = ear(left);
+      const rightEAR= ear(right);
+      const avgEAR = (leftEAR + rightEAR) / 2;
+      earSpan.textContent = avgEAR.toFixed(3);
+
+      drawFrame(lms, left, right);
+
+      const thresh = parseFloat(threshEl.value);
+      const eyesClosed = avgEAR < thresh;
+      if (eyesClosed) {
+        if (!closedStart) closedStart = performance.now();
+        const elapsed = performance.now() - closedStart;
+        closedEl.textContent = elapsed.toFixed(0);
+        if (elapsed >= HOLD_MS) {
+          const t = Math.max(0, elapsed - HOLD_MS);
+          const vol = Math.min(1.0, 0.10 + (t / RAMP_MS)); // يزداد تدريجياً
+          setVolume(vol);
+        } else {
+          setVolume(0.0);
+        }
+      } else {
+        handleEyesOpen();
+      }
+    }
+
+    function handleEyesOpen() {
+      closedStart = null; closedEl.textContent = '0'; setVolume(0.0);
+    }
+
+    function drawFrame(lms, left, right) {
+      if (!video.videoWidth) return;
+      ctx.clearRect(0,0,canvas.width, canvas.height);
+      if (!lms) return;
+      const W = canvas.width, H = canvas.height;
+      function toXY(p){ return [p.x*W, p.y*H]; }
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#66d3ff';
+
+      function drawEye(pts) {
+        ctx.beginPath();
+        pts.forEach((p,i)=>{
+          const [x,y] = toXY(p);
+          if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+        });
+        const [x0,y0] = toXY(pts[0]);
+        ctx.lineTo(x0,y0);
+        ctx.stroke();
+      }
+      if (left && right) { drawEye(left); drawEye(right); }
+    }
+
+    async function start() {
+      initAudio(); // يجب استدعاؤه بتفاعل المستخدم (زر بدء)
+      // على iOS قد يكون AudioContext بحالة suspended — سنعيد تفعيله بعد start
+      await setupFaceMesh();
+      await startCamera();
+      if (audioCtx && audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch(e){} }
+      startBtn.disabled = true; stopBtn.disabled = false; stateEl.textContent = 'يعمل';
+    }
+
+    async function stop() {
+      try {
+        if (rafId) cancelAnimationFrame(rafId);
+        const s = video.srcObject;
+        if (s) s.getTracks().forEach(t => t.stop());
+      } catch(e){}
+      stopAudio();
+      startBtn.disabled = false; stopBtn.disabled = true; stateEl.textContent = 'متوقف';
+      ctx.clearRect(0,0,canvas.width, canvas.height);
+      closedStart = null; earSpan.textContent = '-'; closedEl.textContent = '0';
+    }
+
+    startBtn.addEventListener('click', async ()=>{
+      try { await start(); }
+      catch (e) { alert('تعذر بدء الكاميرا. تأكد من السماح بالوصول، أو جرّب Safari.'); console.error(e); }
+    });
+    stopBtn.addEventListener('click', stop);
+
+    // كتم الصوت عند مغادرة التبويب
+    document.addEventListener('visibilitychange', ()=>{ if (document.hidden) stopAudio(); });
+  </script>
+</body>
+</html>
