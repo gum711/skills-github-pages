@@ -107,7 +107,9 @@
     // حالة الكشف
     let closedStart = null; // طابع زمني عند بداية الإغلاق
     const HOLD_MS = 1000;   // 1s قبل بدء التنبيه
-    const THRESH = 0.27; // عتبة افتراضية ثابتة لاغلاق العين
+    const THRESH = 0.23; // عتبة افتراضية أدق لتقليل الإنذارات الكاذبة
+    let closedFrames = 0;           // عداد الإطارات المتتالية المغلقة
+    const FRAMES_THRESH = 10;       // يلزم 10 إطارات متتالية لتأكيد الإغلاق (~0.3–0.4s)
     const RAMP_MS = 4000;   // للوصول لأقصى صوت
 
     // EAR من نقاط العين (6 نقاط لكل عين)
@@ -194,15 +196,27 @@
       const eyesClosed = avgEAR < thresh;
       if (eyesClosed) {
         if (typeof ledEl !== 'undefined' && ledEl) { ledEl.classList.remove('green'); ledEl.classList.add('red'); }
-        if (!closedStart) closedStart = performance.now();
-        const elapsed = performance.now() - closedStart;
-        closedEl.textContent = elapsed.toFixed(0);
-        if (elapsed >= HOLD_MS) {
-          // ابدأ بصوت منخفض ثم ازده تدريجيًا
-          const t = Math.max(0, elapsed - HOLD_MS);
-          const vol = Math.min(1.0, 0.10 + (t / RAMP_MS));
-          setVolume(vol);
+        // عدّ الإطارات المتتالية
+        closedFrames++;
+        if (closedFrames >= FRAMES_THRESH) {
+          // بعد التأكيد بالإطارات نبدأ عدّ الزمن
+          if (!closedStart) closedStart = performance.now();
+          const elapsed = performance.now() - closedStart;
+          closedEl.textContent = elapsed.toFixed(0);
+          if (elapsed >= HOLD_MS) {
+            const t = Math.max(0, elapsed - HOLD_MS);
+            const vol = Math.min(1.0, 0.10 + (t / RAMP_MS));
+            setVolume(vol);
+          } else {
+            setVolume(0.0);
+          }
         } else {
+          // لم نتأكد بعد
+          closedStart = null;
+          closedEl.textContent = '0';
+          setVolume(0.0);
+        }
+      } else {
           setVolume(0.0);
         }
       } else {
@@ -211,8 +225,12 @@
     }
 
     function handleEyesOpen() {
-      closedStart = null; closedEl.textContent = '0'; setVolume(0.0);
+      closedStart = null;
+      closedFrames = 0;
+      closedEl.textContent = '0';
+      setVolume(0.0);
       if (typeof ledEl !== 'undefined' && ledEl) { ledEl.classList.remove('red'); ledEl.classList.add('green'); }
+    }
     }
 
     function drawFrame(lms, left, right) {
